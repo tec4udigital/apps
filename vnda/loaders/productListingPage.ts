@@ -13,8 +13,9 @@ import {
   getSEOFromTag,
   toFilters,
   toProduct,
-  typeTagExtractor,
 } from "../utils/transform.ts";
+
+// typeTagExtractor removido dos imports — substituído por parseTypeTagsFromUrl
 
 export const VNDA_SORT_OPTIONS: SortOption[] = [
   { value: "", label: "Relevância" },
@@ -34,33 +35,22 @@ interface FilterOperator {
 }
 
 export interface Props {
-  /**
-   * @description overides the query term
-   */
+  /** @description overides the query term */
   term?: string;
-  /**
-   * @description filter products by tag
-   */
+  /** @description filter products by tag */
   tags?: string[];
   /**
    * @title Items per page
    * @description number of products per page to display
    */
   count: number;
-  /**
-   * @title Sorting
-   */
+  /** @title Sorting */
   sort?: Sort;
-  /**
-   * Slug for category pages
-   */
+  /** Slug for category pages */
   slug?: RequestURLParam;
-
   filterByTags?: boolean;
-
   /** @description if properties are empty, "typeTags" value will apply to all. Defaults to "and" */
   filterOperator?: FilterOperator;
-
   /**
    * @hide true
    * @description The URL of the page, used to override URL from request
@@ -88,6 +78,62 @@ const handleOperator = (
 });
 
 /**
+ * Busca uma tag pelo nome, retornando undefined em caso de erro.
+ */
+const fetchTag = (
+  api: AppContext["api"],
+  name: string,
+): Promise<Tag | undefined> =>
+  api["GET /api/v2/tags/:name"]({ name }, STALE)
+    .then((res) => res.json() as Promise<Tag>)
+    .catch((): undefined => undefined);
+
+/**
+ * Substitui typeTagExtractor(url, filteredTags) construindo os dados
+ * diretamente da URL — sem nenhuma chamada à /api/v2/tags/:name.
+ *
+ * Por que é seguro:
+ *   A URL já contém tudo que typeTagExtractor precisava da API:
+ *   type_tags[Finalidade][]=finalidade-corrida
+ *     → key      = 'type_tags[Finalidade][]'   (está na URL)
+ *     → value    = 'finalidade-corrida'         (está na URL)
+ *     → isProperty = false                      (derivado do key)
+ *
+ *   A única coisa que typeTagExtractor fazia com filteredTags era
+ *   validar se o slug existia na VNDA. Slugs inválidos na URL são
+ *   simplesmente ignorados pelo products/search — sem impacto funcional.
+ */
+interface TypeTag {
+  key: string;
+  value: string;
+  isProperty: boolean;
+}
+
+const parseTypeTagsFromUrl = (url: URL): { typeTags: TypeTag[]; cleanUrl: URL } => {
+  const TYPE_TAG_PATTERN = /^type_tags\[(.+)\]\[\]$/;
+
+  const typeTags = [...url.searchParams.entries()]
+    .filter(([key]) => TYPE_TAG_PATTERN.test(key))
+    .map(([key, value]) => {
+      const keyName = key.match(TYPE_TAG_PATTERN)?.[1] ?? "";
+      return {
+        key,
+        value,
+        isProperty: /^property\d+$/.test(keyName),
+      };
+    });
+
+  // cleanUrl: URL sem nenhum param type_tags (usada pelo toFilters para
+  // construir os links de adicionar/remover filtros na sidebar)
+  const cleanUrl = new URL(url.href);
+  [...cleanUrl.searchParams.keys()]
+    .filter((k) => k.startsWith("type_tags"))
+    .forEach((k) => cleanUrl.searchParams.delete(k));
+
+  return { typeTags, cleanUrl };
+};
+
+/**
  * @title VNDA Integration
  * @description Product Listing Page loader
  */
@@ -96,7 +142,6 @@ const searchLoader = async (
   req: Request,
   ctx: AppContext,
 ): Promise<ProductListingPage | null> => {
-  // get url from params
   const url = new URL(props.pageHref || req.url);
   const { api } = ctx;
 
@@ -108,44 +153,59 @@ const searchLoader = async (
   const isSearchPage = ctx.searchPagePath
     ? ctx.searchPagePath === url.pathname
     : url.pathname === "/busca" || url.pathname === "/s";
+
   const qQueryString = url.searchParams.get("q");
-  const term = props.term || props.slug || qQueryString ||
-    undefined;
+  const term = props.term || props.slug || qQueryString || undefined;
 
   const priceFilterRegex = /de-(\d+)-a-(\d+)/;
   const filterMatch = url.href.match(priceFilterRegex) ?? [];
 
-  const categoryTagName = (props.term || url.pathname.slice(1) || "").split(
-    "/",
-  );
+  const categoryTagName = (props.term || url.pathname.slice(1) || "").split("/");
 
   const properties1 = url.searchParams.getAll("type_tags[property1][]");
   const properties2 = url.searchParams.getAll("type_tags[property2][]");
   const properties3 = url.searchParams.getAll("type_tags[property3][]");
 
-  const categoryTagNames = Array.from(url.searchParams.values());
+  // ─── MÁXIMA OTIMIZAÇÃO: /api/v2/tags/:name apenas para o pathname ─────────
+  //
+  // Tags do pathname são as ÚNICAS que precisam ser resolvidas via API:
+  //   ✅ tag.title → breadcrumb ("Tênis para Corrida" ≠ "tenis-para-corrida")
+  //   ✅ tag object → getSEOFromTag (título/descrição SEO da categoria)
+  //
+  // Tags dos params type_tags[X][]=value NÃO são mais buscadas:
+  //   • typeTagExtractor substituído por parseTypeTagsFromUrl (zero chamadas)
+  //   • A URL já contém key + value + isProperty — sem necessidade de API
+  //   • Slugs inválidos na URL → ignorados pelo products/search, sem impacto
+  //
+  // Redução de chamadas:
+  //   URL acessorios (atual) : 9 → 3 chamadas  (67% menos)
+  //   URL log 429 (hoka)     : 12 → 5 chamadas (58% menos)
+  //   URL filtro fila        : 3 → 1 chamada   (67% menos)
+  // ─────────────────────────────────────────────────────────────────────────
 
-  const tags = await Promise.all([
-    ...categoryTagNames,
-    ...categoryTagName.filter((item): item is string =>
-      typeof item === "string"
+  const uniquePathNames = [
+    ...new Set(
+      categoryTagName.filter((item): item is string => typeof item === "string"),
     ),
-  ].map((name) =>
-    api["GET /api/v2/tags/:name"]({ name }, STALE)
-      .then((res) => res.json())
-      .catch(() => undefined)
-  ));
+  ];
 
-  const categories = tags
-    .slice(-categoryTagName.length)
+  const tagByName = new Map<string, Tag | undefined>(
+    await Promise.all(
+      uniquePathNames.map(
+        async (name) => [name, await fetchTag(api, name)] as const,
+      ),
+    ),
+  );
+
+  // categories: segmentos do pathname resolvidos (breadcrumb + SEO)
+  const categories = categoryTagName
+    .map((name) => tagByName.get(name))
     .filter((tag): tag is Tag =>
       typeof tag !== "undefined" && typeof tag.name !== "undefined"
     );
 
-  const filteredTags = tags
-    .filter((tag): tag is Tag => typeof tag !== "undefined");
-
-  const { cleanUrl, typeTags } = typeTagExtractor(url, filteredTags);
+  // typeTags e cleanUrl construídos da URL — zero chamadas à API de tags
+  const { typeTags, cleanUrl } = parseTypeTagsFromUrl(url);
 
   const initialTags = props.tags && props.tags?.length > 0
     ? props.tags
@@ -165,7 +225,7 @@ const searchLoader = async (
   const tag = categories.at(-1);
 
   const [response, seo = []] = await Promise.all([
-    await api["GET /api/v2/products/search"]({
+    api["GET /api/v2/products/search"]({
       term: term ?? preference,
       sort,
       page,
@@ -211,19 +271,15 @@ const searchLoader = async (
   ) as ProductSearchResult["pagination"] | null;
 
   const search = await response.json();
-
   const { results: searchResults = [] } = search;
 
-  const validProducts = searchResults.filter(({ variants }) => {
-    return variants.length !== 0;
-  });
+  const validProducts = searchResults.filter(({ variants }) =>
+    variants.length !== 0
+  );
 
-  const products = validProducts.map((product) => {
-    return toProduct(product, null, {
-      url,
-      priceCurrency: "BRL",
-    });
-  });
+  const products = validProducts.map((product) =>
+    toProduct(product, null, { url, priceCurrency: "BRL" })
+  );
 
   const nextPage = new URLSearchParams(url.searchParams);
   const previousPage = new URLSearchParams(url.searchParams);
@@ -247,11 +303,7 @@ const searchLoader = async (
     "@type": "ProductListingPage",
     seo: getSEOFromTag(categories, url, seo.at(-1), hasTypeTags, isSearchPage),
     breadcrumb: isSearchPage
-      ? {
-        "@type": "BreadcrumbList",
-        itemListElement: [],
-        numberOfItems: 0,
-      }
+      ? { "@type": "BreadcrumbList", itemListElement: [], numberOfItems: 0 }
       : getBreadcrumbList(categories, url),
     filters: toFilters(search.aggregations, typeTags, cleanUrl),
     products,
@@ -270,12 +322,9 @@ export const cache = "stale-while-revalidate";
 export const cacheKey = (props: Props, req: Request, _ctx: AppContext) => {
   const url = new URL(props.pageHref || req.url);
   const qQueryString = url.searchParams.get("q");
-  const term = props.term || qQueryString ||
-    undefined;
+  const term = props.term || qQueryString || undefined;
 
-  if (term) {
-    return null;
-  }
+  if (term) return null;
 
   const typeTags = [...url.searchParams.entries()]
     .filter(([key]) => key.includes("type_tags"))
@@ -299,17 +348,13 @@ export const cacheKey = (props: Props, req: Request, _ctx: AppContext) => {
     ["sort", url.searchParams.get("sort") ?? props.sort ?? ""],
     ["type_tags", typeTags],
     ["tags", props?.tags?.join("\\") ?? ""],
-    [
-      "price",
-      filterMatch ? `min:${filterMatch[1]}_max:${filterMatch[2]}` : "",
-    ],
+    ["price", filterMatch ? `min:${filterMatch[1]}_max:${filterMatch[2]}` : ""],
     ["filterByTags", props.filterByTags ? "true" : "false"],
     ["filterOperator", filterOperators.join("\\")],
     ["page", (url.searchParams.get("page") ?? 1).toString()],
   ]);
 
   params.sort();
-
   url.search = params.toString();
   return url.href;
 };
